@@ -109,6 +109,7 @@ public class DeviceCamera:ICameraV4
                 Thread.Sleep(50);
                 cameraConfig.SetTargetFormatSel(2);//设置raw-16格式
                 Thread.Sleep(50);
+                cameraConfig.StartExposure();
                 cameraConfig.SetExposureTime(1000000);//设置曝光时间为1s
                 cameraState = CameraStates.cameraIdle;
                 IsOnline =true;
