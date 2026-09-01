@@ -13,6 +13,7 @@ using System;
 using System.Collections;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using static System.Windows.Forms.VisualStyles.VisualStyleElement;
 
@@ -65,11 +66,13 @@ public class DeviceCamera:ICameraV4
     private Util utilities;
     private AstroUtils astroUtilities;
     public ImageMatrix currentFrame=null;
+    private readonly object imageLock = new object();//后台采集线程与轮询线程之间的锁
+    private bool captureDone = false;//后台采集线程完成标志
+    private long exposureGeneration = 0;//曝光代次，用于丢弃过期采集结果
 
 
     public DeviceCamera()
     {
-        System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: DeviceCamera callback\n");
         tl = new TraceLogger("", "MyCamera");
         ReadProfile();
         tl.LogMessage("MyCamera", "Starting initialisation");
@@ -94,11 +97,13 @@ public class DeviceCamera:ICameraV4
         {
             try
             {
-                System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: ConnectCamera callback\n");
+                uint camCount = 0;
+                dvpStatus refreshStatus = DVPCamera.dvpRefresh(ref camCount);
+                CameraLog.Write($"{DateTime.Now}: dvpRefresh status={refreshStatus} count={camCount} callback\n");
                 dvpStatus status = DVPCamera.dvpOpenByName(cameraName, dvpOpenMode.OPEN_NORMAL, ref cameraHandle);//相机打开
                 if (status != dvpStatus.DVP_STATUS_OK)
                 {
-                    return false;
+                    throw new ASCOM.NotConnectedException("打开相机失败: " + status.ToString());
                 }
                 cameraConfig = new CameraConfig(cameraHandle);//相机配置函数
                 Thread.Sleep(100);
@@ -119,7 +124,7 @@ public class DeviceCamera:ICameraV4
             }
             catch (Exception)
             {
-                return false;
+                throw;
             }   
         }
         else
@@ -151,7 +156,7 @@ public class DeviceCamera:ICameraV4
     }
 
     public void AbortExposure()
-    {   
+    {
         cameraImageReady = false;
         IsOnline = CheckConnection();
         if (!IsOnline)
@@ -162,6 +167,12 @@ public class DeviceCamera:ICameraV4
         }
         try
         {
+            // 清除待处理的异步采集结果，避免残留帧被下次曝光读到
+            lock (imageLock)
+            {
+                currentFrame = null;
+                captureDone = false;
+            }
             cameraState = CameraStates.cameraIdle;
         }
         catch (Exception)
@@ -169,7 +180,7 @@ public class DeviceCamera:ICameraV4
             tl.LogMessage("AbortExposure", "error");
             throw new MethodNotImplementedException("AbortExposure error");
         }
-        
+
     }
 
     public short BayerOffsetX
@@ -502,7 +513,6 @@ public class DeviceCamera:ICameraV4
             }
             dvpFloatDescr gainDescr = cameraConfig.GetGainDescr();
             float gainVal = ((float)value) * gainDescr.fStep + gainDescr.fMin;
-            System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: gain set {gainVal} callback\n");
             cameraConfig.SetGain(gainVal);
             tl.LogMessage("Gain Set", "implemented");
         }
@@ -590,17 +600,19 @@ public class DeviceCamera:ICameraV4
     {
         get
         {
-            System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: ImageArray callback\n");
             if (!cameraImageReady)
             {
                 tl.LogMessage("ImageArray Get", "Throwing InvalidOperationException because of a call to ImageArray before the first image has been taken!");
                 throw new ASCOM.InvalidOperationException("Call to ImageArray before the first image has been taken!");
             }
-            cameraImageArray = new int[cameraNumX, cameraNumY];
+            // 直接返回当前帧数据引用，不额外分配大数组（原 new int[..] 是死代码，且会在32位进程里触发 OOM）
             cameraImageArray = currentImageArray;
             cameraState = CameraStates.cameraIdle;
             cameraImageReady = false;
             currentImageArray = null;
+            // 及时回收上一帧的大对象（byte[]/int[,] 都进 LOH 大对象堆），并压缩 LOH 消除碎片，避免32位进程长期运行内存耗尽/超时
+            System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect();
             return cameraImageArray;
         }
     }
@@ -609,7 +621,6 @@ public class DeviceCamera:ICameraV4
     {
         get
         {
-            System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: ImageArrayVariant callback\n");
             if (!cameraImageReady)
             {
                 tl.LogMessage("ImageArrayVariant Get", "Throwing InvalidOperationException because of a call to ImageArrayVariant before the first image has been taken!");
@@ -633,18 +644,25 @@ public class DeviceCamera:ICameraV4
         {
             if ((cameraState == CameraStates.cameraWaiting)&&!cameraImageReady)
             {
-                short currentPercent = (short)((100 * GetTimeStamp() - 100 * lastTimeStamp) / ((long)(cameraLastExposureDuration * 1000)));
-                System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: ImageReady check {currentPercent} callback\n");
-                if (currentPercent >= 100) 
+                // 防止 lastTimeStamp 未初始化或曝光时长为0时除零/溢出
+                double elapsedMs = GetTimeStamp() - lastTimeStamp;
+                double totalMs = Math.Max(cameraLastExposureDuration * 1000, 1);
+                short currentPercent = (short)Math.Max(0, Math.Min(100, (100.0 * elapsedMs) / totalMs));
+                if (currentPercent >= 100)
                 {
-                    if (currentFrame.Data2D != null) 
+                    lock (imageLock)
                     {
-                        currentImageArray = new int[cameraNumX, cameraNumY];
-                        currentImageArray= currentFrame.Data2D;
-                        cameraState = CameraStates.cameraReading;
-                        currentFrame=null;
-                        cameraImageReady = true;
-                        
+                        // 先判空再解引用，避免后台采集尚未完成（currentFrame 仍为 null）时轮询线程抛 NullReferenceException
+                        if (captureDone && currentFrame != null && currentFrame.Data2D != null)
+                        {
+                            // 直接引用当前帧数据，不额外分配大数组（原 new int[..] 是死代码，且会在32位进程里触发 OOM）
+                            currentImageArray= currentFrame.Data2D;
+                            cameraState = CameraStates.cameraReading;
+                            currentFrame=null;
+                            captureDone = false;
+                            cameraImageReady = true;
+
+                        }
                     }
                 }
             }
@@ -742,9 +760,19 @@ public class DeviceCamera:ICameraV4
         }
         set
         {
+            // 仅支持全画幅宽度（随 bin 变化），合法的全画幅值直接接受，非法值才抛异常
+            int legalWidth;
+            switch (binmode)
+            {
+                case 2: legalWidth = ccdWidth / 2; break;
+                case 3: legalWidth = ccdWidth / 3; break;
+                case 4: legalWidth = ccdWidth / 4; break;
+                default: legalWidth = ccdWidth; break;
+            }
+            if (value != legalWidth)
+                throw new ASCOM.InvalidValueException("NumX", value.ToString(), legalWidth.ToString());
             cameraNumX = value;
             tl.LogMessage("NumX set", value.ToString());
-            throw new ASCOM.InvalidValueException("NumY setting unsupport");
         }
     }
 
@@ -772,9 +800,19 @@ public class DeviceCamera:ICameraV4
         }
         set
         {
+            // 仅支持全画幅高度（随 bin 变化），合法的全画幅值直接接受，非法值才抛异常
+            int legalHeight;
+            switch (binmode)
+            {
+                case 2: legalHeight = ccdHeight / 2; break;
+                case 3: legalHeight = ccdHeight / 3; break;
+                case 4: legalHeight = ccdHeight / 4; break;
+                default: legalHeight = ccdHeight; break;
+            }
+            if (value != legalHeight)
+                throw new ASCOM.InvalidValueException("NumY", value.ToString(), legalHeight.ToString());
             cameraNumY = value;
             tl.LogMessage("NumY set", value.ToString());
-            throw new ASCOM.InvalidValueException("NumY setting unsupport");
         }
     }
 
@@ -823,11 +861,13 @@ public class DeviceCamera:ICameraV4
     {
         get
         {
-            short Percent = (short)((100 * GetTimeStamp() - 100 * lastTimeStamp) / ((long)(cameraLastExposureDuration * 1000)));
-            
+            // 防止未开始曝光（lastTimeStamp 默认0）或时长为0时产生负数/溢出
+            double elapsedMs = GetTimeStamp() - lastTimeStamp;
+            double totalMs = Math.Max(cameraLastExposureDuration * 1000, 1);
+            short Percent = (short)Math.Max(0, Math.Min(100, (100.0 * elapsedMs) / totalMs));
+
             tl.LogMessage("PercentCompleted Get", "implemented");
-            System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: PercentCompleted {Percent} callback\n");
-       
+
             return Percent;
         }
     }
@@ -918,27 +958,67 @@ public class DeviceCamera:ICameraV4
         if (cameraNumY > ccdHeight) throw new InvalidValueException("StartExposure", cameraNumY.ToString(), ccdHeight.ToString());
         if (cameraStartX > ccdWidth) throw new InvalidValueException("StartExposure", cameraStartX.ToString(), ccdWidth.ToString());
         if (cameraStartY > ccdHeight) throw new InvalidValueException("StartExposure", cameraStartY.ToString(), ccdHeight.ToString());
-        currentFrame=null;
         IsOnline = CheckConnection();
         if (!IsOnline)
         {
-            tl.LogMessage("StopExposure", "disconnected");
+            tl.LogMessage("StartExposure", "disconnected");
             cameraState = CameraStates.cameraError;
-            throw new MethodNotImplementedException("StopExposure");
+            throw new MethodNotImplementedException("StartExposure");
         }
-        System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: StartExposure callback\n");
-        cameraImageReady =false;
+        cameraImageReady = false;
         cameraState = CameraStates.cameraWaiting;
-        System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: SetExposureTime callback\n");
-        
+
         exposureStart = DateTime.Now;
         lastTimeStamp = GetTimeStamp();//记录开始的时间戳
-        currentFrame = cameraConfig.StartMultiExposure(Duration);
-        if (Duration >= 10) 
+        if (Duration >= 10)
         {
             Duration = ((int)Duration / 10) * 10;
         }
         cameraLastExposureDuration = Duration;
+
+        // 在后台任务里异步采集图像，StartExposure 立即返回。
+        // 不能在 StartExposure 里阻塞等待图像：PHD2 会由独立线程并发轮询
+        // ImageReady/CameraState/PercentCompleted，阻塞期间 currentFrame 仍为 null，
+        // 轮询线程访问 currentFrame.Data2D 会触发 NullReferenceException（相机轮询异常）。
+        long gen = Interlocked.Increment(ref exposureGeneration);
+        lock (imageLock)
+        {
+            currentFrame = null;
+            captureDone = false;
+        }
+
+        Task.Run(async () =>
+        {
+            try
+            {
+                ImageMatrix frame = (Duration >= 10)
+                    ? await cameraConfig.StartMultiExposureAsync(Duration)
+                    : await cameraConfig.StartSingleExposureAsync(Duration);
+
+                lock (imageLock)
+                {
+                    // 仅当仍是当前代次的曝光时才提交结果，避免被 AbortExposure 或新曝光覆盖
+                    if (gen == exposureGeneration)
+                    {
+                        currentFrame = frame;
+                        captureDone = true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                tl.LogMessage("StartExposure", "async capture error: " + ex.Message);
+                lock (imageLock)
+                {
+                    if (gen == exposureGeneration)
+                    {
+                        currentFrame = null;
+                        captureDone = false;
+                    }
+                }
+                cameraState = CameraStates.cameraError;
+            }
+        });
         tl.LogMessage("StartExposure", Duration.ToString() + " " + Light.ToString());
     }
 
@@ -951,9 +1031,11 @@ public class DeviceCamera:ICameraV4
         }
         set
         {
+            // 仅支持全画幅（StartX 只能为 0），合法的 0 直接接受，非法值才抛异常
+            if (value != 0)
+                throw new ASCOM.InvalidValueException("StartX", value.ToString(), "subframe unsupported, only 0");
             cameraStartX = 0;
             tl.LogMessage("StartX Set", value.ToString());
-            throw new ASCOM.InvalidValueException("StartX setting unsupport");
         }
     }
 
@@ -966,9 +1048,11 @@ public class DeviceCamera:ICameraV4
         }
         set
         {
+            // 仅支持全画幅（StartY 只能为 0），合法的 0 直接接受，非法值才抛异常
+            if (value != 0)
+                throw new ASCOM.InvalidValueException("StartY", value.ToString(), "subframe unsupported, only 0");
             cameraStartY = 0;
             tl.LogMessage("StartY set", value.ToString());
-            throw new ASCOM.InvalidValueException("StartY setting unsupport");
         }
     }
 
@@ -981,7 +1065,6 @@ public class DeviceCamera:ICameraV4
             cameraState = CameraStates.cameraError;
             throw new MethodNotImplementedException("StopExposure");
         }
-        System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"{DateTime.Now}: StopExposure callback\n");
     }
 
     public string Action(string ActionName, string ActionParameters)
@@ -996,13 +1079,11 @@ public class DeviceCamera:ICameraV4
     public void Connect()
     {
         ConnectCamera(true);
-        //System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"Connect callback\n");
     }
 
     public void Disconnect()
     {
         ConnectCamera(false);
-        //System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"Disconnect callback\n");
     }
 
     public double SubExposureDuration
@@ -1033,7 +1114,6 @@ public class DeviceCamera:ICameraV4
         get
         {
             LogMessage("Connected", "Get {0}", IsConnected);
-            //System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"Get Connect {IsConnected.ToString()} callback\n");
             return IsConnected;
         }
         set
@@ -1045,14 +1125,12 @@ public class DeviceCamera:ICameraV4
             if (value)
             {
                 ConnectCamera(true);
-                //System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"Set Connect {value.ToString()} callback\n");
                 LogMessage("Connected Set", "Connecting to port camera");
                 // TODO connect to the device
             }
             else
             {
                 ConnectCamera(false);
-                //System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"Set Connect {value.ToString()} callback\n");
                 LogMessage("Connected Set", "Disconnecting camera");
                 // TODO disconnect from the device
             }
@@ -1065,7 +1143,6 @@ public class DeviceCamera:ICameraV4
         {
             IsOnline = CheckConnection();
             connectedState = IsOnline;
-            //System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"Check Connect {connectedState.ToString()} callback\n");
             // TODO check that the driver hardware connection exists and is connected to the hardware
             return connectedState;
         }
@@ -1085,7 +1162,6 @@ public class DeviceCamera:ICameraV4
     {
         using (Profile driverProfile = new Profile())
         {
-            //System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"Write Profile callback\n");
             driverProfile.DeviceType = "Camera";
             driverProfile.WriteValue(driverID, traceStateProfileName, tl.Enabled.ToString());
             driverProfile.WriteValue(driverID, comPortProfileName, comPort.ToString());
@@ -1094,7 +1170,6 @@ public class DeviceCamera:ICameraV4
 
     public void SetupDialog()
     {
-        //System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", $"Setup Dialog callback\n");
         if (IsConnected)
             System.Windows.Forms.MessageBox.Show("Already connected, just press OK");
 

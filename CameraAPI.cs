@@ -1,10 +1,32 @@
 ﻿using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
 using DVPCameraType;
 
 namespace MyCameraAPI
 {
+    //线程安全的调试日志辅助类：加锁串行写入，日志失败（文件被占用等）绝不影响相机驱动运行
+    public static class CameraLog
+    {
+        private static readonly object sync = new object();
+
+        public static void Write(string msg)
+        {
+            try
+            {
+                lock (sync)
+                {
+                    System.IO.File.AppendAllText(@"C:\temp\camera_debug.txt", msg);
+                }
+            }
+            catch (Exception)
+            {
+                // 调试日志失败不影响驱动
+            }
+        }
+    }
+
     public class CameraConfig
     {
         private uint handle;
@@ -20,12 +42,13 @@ namespace MyCameraAPI
         {
             try
             {
-                DVPCamera.dvpStart(handle);
+                dvpStatus startStatus = DVPCamera.dvpStart(handle);
+                CameraLog.Write($"{DateTime.Now}: dvpStart status={startStatus} callback\n");
                 return true;
             }
             catch (Exception ex)
             {
-                //Console.WriteLine($"设置曝光时间异常: {ex.Message}");
+                CameraLog.Write($"{DateTime.Now}: dvpStart EXCEPTION {ex.Message} callback\n");
                 return false;
             }
         }
@@ -895,18 +918,41 @@ namespace MyCameraAPI
             }
         }
 
-        //用于单次曝光或者多重曝光
-        public ImageMatrix StartMultiExposure(double exposureTime)
+        //单次曝光（小于10秒，异步）：在后台线程采集一帧并返回
+        public Task<ImageMatrix> StartSingleExposureAsync(double exposureTime)
         {
-            ImageMatrix resultImage = null;
+            return Task.Run(() =>
+            {
+                SetExposureTime(exposureTime * 1000000);
 
-            if (exposureTime >= 10)
+                // 循环等待并读取图像
+                while (true)
+                {
+                    ImageMatrix currentFrame = camera.CaptureSingleImage(handle);
+
+                    // 检查图像是否有效
+                    if (currentFrame != null && currentFrame.Data2D != null)
+                    {
+                        return currentFrame; // 成功读取到有效图像
+                    }
+
+                    // 等待一段时间后重试，避免忙等占用CPU
+                    System.Threading.Thread.Sleep(50);
+                }
+            });
+        }
+
+        //多重曝光（大于等于10秒，异步）：拆分为多个10s帧累加后返回
+        public Task<ImageMatrix> StartMultiExposureAsync(double exposureTime)
+        {
+            return Task.Run(() =>
             {
                 uint exposureCount = (uint)(exposureTime / 10);
 
-                // 用于存储累积和的二维矩阵 (使用long避免溢出，因为多次累加可能超过int范围)
-                long[,] sumMatrix = null;
+                // 累积和矩阵：累加时逐像素饱和限制在 0~65535，用 int 即可（比 long 省一半内存）
+                int[,] sumMatrix = null;
                 uint validFrameCount = 0;
+                const int MAX_USHORT = 65535;
 
                 for (int i = 0; i < exposureCount; i++)
                 {
@@ -931,7 +977,7 @@ namespace MyCameraAPI
                     if (sumMatrix == null)
                     {
                         // 第一次成功采集，初始化累加矩阵
-                        sumMatrix = new long[currentFrame.Width, currentFrame.Height];
+                        sumMatrix = new int[currentFrame.Width, currentFrame.Height];
                         validFrameCount = 1;
 
                         // 直接复制当前帧到累加矩阵
@@ -945,55 +991,47 @@ namespace MyCameraAPI
                     }
                     else
                     {
-                        // 累加模式：直接相加
+                        // 累加模式：临时 int 相加（两帧各≤65535，和≤131070不溢出）后立即饱和
                         validFrameCount++;
                         for (int x = 0; x < currentFrame.Width; x++)
                         {
                             for (int y = 0; y < currentFrame.Height; y++)
                             {
-                                sumMatrix[x, y] += currentFrame.Data2D[x, y];
+                                int temp = sumMatrix[x, y] + currentFrame.Data2D[x, y];
+                                sumMatrix[x, y] = Math.Min(temp, MAX_USHORT);
                             }
                         }
                     }
                 }
 
-                // 将累加矩阵转换为 ImageMatrix 返回（带饱和处理）
+                // 将累加矩阵转换为 ImageMatrix 返回（累加时已逐像素饱和，直接拷贝）
                 if (sumMatrix != null && validFrameCount > 0)
                 {
-                    const int MAX_USHORT = 65535;
-
-                    resultImage = new ImageMatrix(sumMatrix.GetLength(0), sumMatrix.GetLength(1), 16, 1);
+                    ImageMatrix resultImage = new ImageMatrix(sumMatrix.GetLength(0), sumMatrix.GetLength(1), 16, 1);
                     for (int x = 0; x < resultImage.Width; x++)
                     {
                         for (int y = 0; y < resultImage.Height; y++)
                         {
-                            long value = sumMatrix[x, y];
-                            // 饱和处理：限制在 0 到 65535 范围内
-                            resultImage.Data2D[x, y] = (int)Math.Min(value, MAX_USHORT);
+                            resultImage.Data2D[x, y] = sumMatrix[x, y];
                         }
                     }
+                    return resultImage;
                 }
-            }
-            else // 单次曝光（小于10秒）
+                return null;
+            });
+        }
+
+        //同步入口：按曝光时长分派到单次或多次曝光
+        public ImageMatrix StartMultiExposure(double exposureTime)
+        {
+            if (exposureTime >= 10)
             {
-                SetExposureTime(exposureTime * 1000000);
-
-                // 循环等待并读取图像
-                ImageMatrix currentFrame = null;
-                while (true)
-                {
-                    currentFrame = camera.CaptureSingleImage(handle);
-
-                    // 检查图像是否有效
-                    if (currentFrame != null && currentFrame.Data2D != null)
-                    {
-                        resultImage = currentFrame;
-                        break; // 成功读取到有效图像，跳出等待循环
-                    }
-                   
-                }
+                return StartMultiExposureAsync(exposureTime).GetAwaiter().GetResult();
             }
-            return resultImage;
+            else
+            {
+                return StartSingleExposureAsync(exposureTime).GetAwaiter().GetResult();
+            }
         }
 
 
@@ -1001,6 +1039,8 @@ namespace MyCameraAPI
     //图像采集类
     public class CameraCapture
     {
+        private byte[] frameBuffer = null;//复用的帧缓冲，避免每帧 new 大数组导致 LOH 碎片化（bin 变化时按需扩容）
+
         private int GetBitsPerPixel(DVPCameraType.dvpBits bits)
         {
             switch (bits)
@@ -1049,13 +1089,16 @@ namespace MyCameraAPI
                 // 创建图像矩阵
                 ImageMatrix imageMatrix = new ImageMatrix(width, height, bitsPerPixel, channels);
 
-                // 复制图像数据
-                byte[] imageData = new byte[bufferLength];
-                Marshal.Copy(bufferStart, imageData, 0, (int)bufferLength);
+                // 复用帧缓冲，避免每帧 new 大数组导致 LOH 碎片化（bin 变化时按需扩容）
+                if (frameBuffer == null || frameBuffer.Length < bufferLength)
+                {
+                    frameBuffer = new byte[bufferLength];
+                }
+                Marshal.Copy(bufferStart, frameBuffer, 0, (int)bufferLength);
 
                 if (isBGR)
                 {
-                    // BGR24格式：三通道，直接填充到 ushort 矩阵
+                    // BGR24格式：三通道，直接填充到 ushort 矩阵（较少用）
                     int bytesPerPixel = bitsPerPixel / 8;
                     int stride = width * channels * bytesPerPixel;
 
@@ -1073,13 +1116,13 @@ namespace MyCameraAPI
                                 if (bytesPerPixel == 1)
                                 {
                                     // 8位数据
-                                    imageMatrix.Data3D[h, w, c] = imageData[pixelOffset + c];
+                                    imageMatrix.Data3D[h, w, c] = frameBuffer[pixelOffset + c];
                                 }
                                 else if (bytesPerPixel == 2)
                                 {
                                     // 16位数据（小端序）
                                     int byteOffset = pixelOffset + c * 2;
-                                    ushort value = (ushort)(imageData[byteOffset] | (imageData[byteOffset + 1] << 8));
+                                    ushort value = (ushort)(frameBuffer[byteOffset] | (frameBuffer[byteOffset + 1] << 8));
                                     imageMatrix.Data3D[h, w, c] = value;
                                 }
                             }
@@ -1088,7 +1131,7 @@ namespace MyCameraAPI
                 }
                 else
                 {
-                    // 单通道格式（包括 RAW8、RAW10、RAW12、RAW16 等）
+                    // 单通道格式（包括 RAW8、RAW10、RAW12、RAW16 等）— 正常整帧读取，复用 frameBuffer
                     int bytesPerPixel = (int)bufferLength / (width * height);
 
                     for (int h = 0; h < height; h++)
@@ -1101,12 +1144,12 @@ namespace MyCameraAPI
                             if (bytesPerPixel == 1)
                             {
                                 // 8位数据：直接赋值到低位
-                                value = imageData[pixelOffset];
+                                value = frameBuffer[pixelOffset];
                             }
                             else if (bytesPerPixel == 2)
                             {
                                 // 16位数据：合并高低位（小端序）
-                                value = (ushort)(imageData[pixelOffset] | (imageData[pixelOffset + 1] << 8));
+                                value = (ushort)(frameBuffer[pixelOffset] | (frameBuffer[pixelOffset + 1] << 8));
                             }
                             // 存储到单通道矩阵
                             imageMatrix.Data2D[w, h] = value;
@@ -1117,7 +1160,7 @@ namespace MyCameraAPI
             }
             catch (Exception ex)
             {
-             //   Console.WriteLine($"采集图像异常: {ex.Message}");
+                CameraLog.Write($"{DateTime.Now}: CaptureSingleImage ERROR {ex} callback\n");
                 return null;
             }
         }
@@ -1146,8 +1189,11 @@ namespace MyCameraAPI
             BitsPerPixel = bitsPerPixel;
             Channels = channels;
 
-            // 创建 ushort 类型的三维矩阵
-            Data3D = new ushort[height, width, channels];
+            // 驱动是 debayer 前的原始数据，只用到 Data2D；Data3D 仅 BGR 格式才需要（省内存，避免32位进程OOM）
+            if (channels > 1)
+            {
+                Data3D = new ushort[height, width, channels];
+            }
             Data2D = new int[width, height];//int ushort都可以
         }
     }

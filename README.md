@@ -26,6 +26,9 @@ ASCOM 相机驱动，适配 DVP USB3 工业相机（12MP），支持天文拍摄
 1. 安装 ASCOM Platform
 2. 在天文软件（如 N.I.N.A.、SharpCap、MaxIm DL 等）中选择 `ASCOM.DVPCamera.Camera` 即可
 
-## 协议
+## 更新日志
 
-MIT License
+### 2026-09-01
+
+- 重构异步曝光逻辑，修复 PHD2 对相机轮询时的异常行为
+- 优化变量生命周期与状态复用，缓解 x86 进程的内存溢出问题
